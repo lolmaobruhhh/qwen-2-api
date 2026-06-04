@@ -116,6 +116,16 @@ app.post('/v1/chat/completions', async (req, res) => {
 
         // We only send the LATEST user message as per Qwen's graph architecture
         const latestMessage = messages[messages.length - 1];
+        let finalContent = latestMessage.content;
+
+        // If this is a brand new conversation, Qwen's graph needs the System prompt!
+        // Qwen Web UI doesn't natively have a 'System' role, so we inject it into the first User message (standard proxy trick).
+        if (!dbConv || messages.length <= 2) {
+            const systemParts = messages.filter(m => m.role === 'system').map(m => m.content);
+            if (systemParts.length > 0) {
+                finalContent = `[System Instructions]\n${systemParts.join('\n\n')}\n\n[User]\n${finalContent}`;
+            }
+        }
 
         const payload = {
             stream: true, // Qwen always streams internally
@@ -129,8 +139,8 @@ app.post('/v1/chat/completions', async (req, res) => {
                 fid: uuidv4(),
                 parentId: lastMsgId,
                 childrenIds: [uuidv4()],
-                role: latestMessage.role,
-                content: latestMessage.content,
+                role: "user", // Override role to user to ensure Qwen accepts the block
+                content: finalContent,
                 user_action: "chat",
                 files: [],
                 timestamp: Math.floor(Date.now() / 1000),
