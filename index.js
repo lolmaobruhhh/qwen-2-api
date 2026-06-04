@@ -73,17 +73,12 @@ function generateConvKey(req, messages) {
         .map(m => m.content || '')
         .join('|||');
 
-    // Include ALL non-system messages up to the 4th one for maximum entropy
-    // This means: greeting (assistant) + first user + first assistant response + second user
-    // Even if system + greeting + first user are identical between two chats,
-    // by the time the 2nd user message comes in, the hash will diverge.
+    // Include only the FIRST 2 non-system messages (character greeting + first user prompt)
+    // These are universally pinned by frontends and will never shift or grow, guaranteeing perfect fingerprint stability.
     const nonSystem = messages.filter(m => m.role !== 'system');
-    const earlyMessages = nonSystem.slice(0, 4).map(m => `${m.role}:${m.content || ''}`).join('|||');
+    const earlyMessages = nonSystem.slice(0, 2).map(m => `${m.role}:${m.content || ''}`).join('|||');
 
-    // Also include the total non-system message count as extra entropy? NO! 
-    // Including message length causes the hash to change every turn, breaking continuity.
     const seed = systemContent + '|||MSGS|||' + earlyMessages;
-
     return crypto.createHash('sha256').update(seed).digest('hex');
 }
 
@@ -91,7 +86,7 @@ function hashApiKey(key) {
     return crypto.createHash('sha256').update(key || 'anonymous').digest('hex').slice(0, 16);
 }
 
-// Build full query for NEW conversation (dumps entire history)
+// Build full query for NEW conversation
 function buildNewConversationQuery(messages) {
     const parts = [];
     for (const msg of messages) {
@@ -112,7 +107,7 @@ function buildNewConversationQuery(messages) {
     return parts.join('\n\n');
 }
 
-// Build continuation query (only latest user message, optionally with system resend)
+// Build continuation query (only latest user message)
 function buildContinuationQuery(messages) {
     const lastUser = [...messages].reverse().find(m => m.role === 'user');
     return lastUser ? lastUser.content : '';
@@ -127,8 +122,8 @@ app.get('/v1/models', (req, res) => {
         object: 'list',
         data: [
             { id: 'qwen3.7-plus', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'alibaba' },
-            { id: 'qwen-max', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'alibaba' },
-            { id: 'qwen-plus', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'alibaba' },
+            { id: 'qwen3.6-plus', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'alibaba' },
+            { id: 'qwen-max', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'alibaba' }
         ]
     });
 });
@@ -158,7 +153,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         const convKey = generateConvKey(req, messages);
         const completionId = 'chatcmpl-' + crypto.randomBytes(16).toString('hex');
 
-        // ── Conversation tracking (Mimo-style) ──
+        // ── Conversation tracking ──
         let dbConv = getConversation(convKey, apiKeyHash);
         const { autoThinking, thinkingMode, thinkingEnabled, cleanedMessages } = parseDirectives(messages);
 
@@ -173,33 +168,34 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (dbConv) {
             if (cleanedMessages.length > dbConv.message_count) {
                 // ═══ CONTINUATION ═══
-                // Use the SAME account that owns this conversation's Qwen session
                 account = db.prepare('SELECT * FROM accounts WHERE id = ? AND active = 1').get(dbConv.account_id);
-
                 if (account) {
                     isContinuation = true;
                     qwenChatId = dbConv.qwen_chat_id;
                     lastMsgId = dbConv.last_msg_id;
-                    finalContent = buildContinuationQuery(cleanedMessages);
+
+                    var isTurnOne = (dbConv.root_message_count && cleanedMessages.length === dbConv.root_message_count) ||
+                                    (!dbConv.root_message_count && cleanedMessages.filter(function(m) { return m.role === 'user'; }).length === 1);
+                    finalContent = isTurnOne ? buildNewConversationQuery(cleanedMessages) : buildContinuationQuery(cleanedMessages);
 
                     console.log(`[Conv] Continuation: ${convKey.slice(0, 12)}... | msgs: ${dbConv.message_count} -> ${cleanedMessages.length} | account: ${account.email}`);
                 } else {
-                    // Account was deactivated, wipe stale conversation
                     db.prepare('DELETE FROM conversations WHERE conv_key = ? AND api_key_hash = ?').run(convKey, apiKeyHash);
                     dbConv = null;
                 }
-
             } else if (cleanedMessages.length === dbConv.message_count && dbConv.last_msg_id) {
                 // ═══ REROLL ═══
                 account = db.prepare('SELECT * FROM accounts WHERE id = ? AND active = 1').get(dbConv.account_id);
-
                 if (account) {
                     isReroll = true;
-                    isContinuation = true; // bypass new conversation creation
+                    isContinuation = true;
                     qwenChatId = dbConv.qwen_chat_id;
                     lastMsgId = dbConv.last_msg_id;
                     lastUserMsgId = dbConv.last_user_msg_id;
-                    finalContent = buildContinuationQuery(cleanedMessages);
+                    
+                    var isTurnOne = (dbConv.root_message_count && cleanedMessages.length === dbConv.root_message_count) ||
+                                    (!dbConv.root_message_count && cleanedMessages.filter(function(m) { return m.role === 'user'; }).length === 1);
+                    finalContent = isTurnOne ? buildNewConversationQuery(cleanedMessages) : buildContinuationQuery(cleanedMessages);
 
                     console.log(`[Conv] Reroll: ${convKey.slice(0, 12)}... | msgs: ${cleanedMessages.length} | account: ${account.email}`);
                 } else {
@@ -207,21 +203,19 @@ app.post('/v1/chat/completions', async (req, res) => {
                     dbConv = null;
                 }
             }
-            // If cleanedMessages.length < dbConv.message_count, it means the user deleted messages -> new conversation
         }
 
         if (!dbConv || !isContinuation) {
             // ═══ NEW CONVERSATION ═══
-            // Clean up any stale record for this key
             db.prepare('DELETE FROM conversations WHERE conv_key = ? AND api_key_hash = ?').run(convKey, apiKeyHash);
 
             account = getNextAccount();
             if (!account) {
-                return res.status(503).json({ error: { message: 'No active accounts available. Please add accounts in the admin panel.', type: 'server_error' } });
+                return res.status(503).json({ error: { message: 'No active accounts available.', type: 'server_error' } });
             }
 
             finalContent = buildNewConversationQuery(cleanedMessages);
-            console.log(`[Conv] New: ${convKey.slice(0, 12)}... | msgs: ${cleanedMessages.length} | account: ${account.email}`);
+            console.log(`[Conv] New: ${convKey.slice(0, 12)}... | msgs: ${cleanedMessages.length} | model: ${model} | account: ${account.email}`);
         }
 
         // ── Get valid token ──
@@ -229,7 +223,6 @@ app.post('/v1/chat/completions', async (req, res) => {
         try {
             token = await getValidToken(account);
         } catch (authErr) {
-            // ── Auto-disable on auth failure, try fallback ──
             console.error(`[AUTH] Account ${account.email} failed: ${authErr.message} — disabling`);
             deactivateAccount(account.id);
 
@@ -239,7 +232,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                 token = await getValidToken(fallback);
                 account = fallback;
             } else {
-                throw new Error('All accounts failed authentication. Please add fresh accounts in the admin panel.');
+                throw new Error('All accounts failed authentication.');
             }
         }
 
@@ -257,7 +250,7 @@ app.post('/v1/chat/completions', async (req, res) => {
             incremental_output: true,
             chat_id: qwenChatId,
             chat_mode: "normal",
-            model: "qwen3.7-plus",
+            model: model, // Dynamic Model
             parent_id: isReroll ? null : lastMsgId,
             messages: [{
                 fid: uuidv4(),
@@ -269,7 +262,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                 user_action: isReroll ? "retry" : "chat",
                 files: [],
                 timestamp: Math.floor(Date.now() / 1000),
-                models: ["qwen3.7-plus"],
+                models: [model], // Dynamic Model Array
                 chat_type: "t2t",
                 feature_config: {
                     thinking_enabled: thinkingEnabled,
@@ -290,10 +283,9 @@ app.post('/v1/chat/completions', async (req, res) => {
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('Cache-Control', 'no-cache');
             res.setHeader('Connection', 'keep-alive');
-            res.setHeader('X-Accel-Buffering', 'no'); // Prevent nginx/HF proxy from buffering SSE
+            res.setHeader('X-Accel-Buffering', 'no');
             res.setHeader('X-Conversation-Id', convKey);
 
-            // Send initial role chunk
             res.write(`data: ${JSON.stringify({
                 id: completionId,
                 object: "chat.completion.chunk",
@@ -313,7 +305,6 @@ app.post('/v1/chat/completions', async (req, res) => {
         const streamGen = sendChatMessage(token, payload, abortController.signal);
         
         for await (const chunk of streamGen) {
-            // Extract the new parent_id (response_id) and user msg id immediately
             if (chunk['response.created'] && chunk['response.created'].response_id) {
                 newResponseId = chunk['response.created'].response_id;
                 newUserMsgId = chunk['response.created'].parent_id;
@@ -367,7 +358,6 @@ app.post('/v1/chat/completions', async (req, res) => {
             }
         }
 
-        // Close orphaned thinking tag
         if (inThinkingPhase) {
             if (stream) {
                 const c = createOpenAIChunk(completionId, model, '\n</think>\n\n');
@@ -376,19 +366,19 @@ app.post('/v1/chat/completions', async (req, res) => {
             fullThinking += '\n</think>\n\n';
         }
 
-        // Update database with new lastMsgId and userMsgId
+        // Update database for continuation
         createOrUpdateConversation(
             convKey, 
             apiKeyHash, 
             qwenChatId, 
             account.id, 
             cleanedMessages.length, 
+            cleanedMessages.length, // rootMessageCount fallback
             newResponseId,
             newUserMsgId
         );
 
         if (stream) {
-            // Send final chunk with finish_reason: 'stop' (OpenAI spec)
             res.write(`data: ${JSON.stringify({
                 id: completionId,
                 object: "chat.completion.chunk",
@@ -399,7 +389,6 @@ app.post('/v1/chat/completions', async (req, res) => {
             res.write('data: [DONE]\n\n');
             res.end();
         } else {
-            // Non-stream response
             const finalText = fullThinking ? `${fullThinking}${fullContent}` : fullContent;
             res.json({
                 id: completionId,
@@ -436,7 +425,6 @@ app.post('/v1/chat/completions', async (req, res) => {
 //  CLEANUP & BOOT
 // ══════════════════════════════════════════
 
-// Periodically clean old conversations (every hour)
 setInterval(() => {
     try {
         const timeout = CONV_TIMEOUT || 60;
@@ -450,12 +438,10 @@ const PORT = process.env.PORT || 7860;
 app.listen(PORT, () => {
     console.log('');
     console.log('  ╔══════════════════════════════════════╗');
-    console.log('  ║       Qwen2API Reverse Proxy         ║');
+    console.log('  ║    Qwen Native-Continuation Proxy    ║');
     console.log('  ╠══════════════════════════════════════╣');
     console.log(`  ║  Admin Panel : http://localhost:${PORT}   ║`);
     console.log(`  ║  API Base    : http://localhost:${PORT}/v1 ║`);
-    console.log('  ╠══════════════════════════════════════╣');
-    console.log(`  ║  Conv timeout: ${CONV_TIMEOUT} min               ║`);
     console.log('  ╚══════════════════════════════════════╝');
     console.log('');
 });
