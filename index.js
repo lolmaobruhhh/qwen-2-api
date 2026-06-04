@@ -67,13 +67,21 @@ function generateConvKey(req, messages) {
     const headerConvId = req.headers['x-conversation-id'];
     if (headerConvId) return headerConvId;
 
+    // Hash ALL system messages
     const systemContent = messages
         .filter(m => m.role === 'system')
         .map(m => m.content || '')
         .join('|||');
 
-    const firstUser = messages.find(m => m.role === 'user');
-    const seed = systemContent + '|||FIRST_USER|||' + (firstUser ? firstUser.content : '');
+    // Include ALL non-system messages up to the 4th one for maximum entropy
+    // This means: greeting (assistant) + first user + first assistant response + second user
+    // Even if system + greeting + first user are identical between two chats,
+    // by the time the 2nd user message comes in, the hash will diverge.
+    const nonSystem = messages.filter(m => m.role !== 'system');
+    const earlyMessages = nonSystem.slice(0, 4).map(m => `${m.role}:${m.content || ''}`).join('|||');
+
+    // Also include the total non-system message count as extra entropy
+    const seed = systemContent + '|||MSGS|||' + earlyMessages + '|||COUNT|||' + nonSystem.length;
 
     return crypto.createHash('sha256').update(seed).digest('hex');
 }
