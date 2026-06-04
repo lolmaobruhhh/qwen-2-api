@@ -4,7 +4,7 @@ import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { getValidToken } from './lib/auth.js';
 import { createNewChat, sendChatMessage } from './lib/qwenClient.js';
-import { createOpenAIChunk } from './lib/translator.js';
+import { createOpenAIChunk, parseDirectives } from './lib/translator.js';
 import { config } from 'dotenv';
 import db, { 
   getConversation, 
@@ -153,16 +153,18 @@ app.post('/v1/chat/completions', async (req, res) => {
 
         // ── Conversation tracking (Mimo-style) ──
         let dbConv = getConversation(convKey, apiKeyHash);
+        const { autoThinking, thinkingMode, thinkingEnabled, cleanedMessages } = parseDirectives(messages);
 
         let qwenChatId;
         let lastMsgId = null;
+        let lastUserMsgId = null;
         let account;
         let isContinuation = false;
         let isReroll = false;
         let finalContent;
 
         if (dbConv) {
-            if (messages.length > dbConv.message_count) {
+            if (cleanedMessages.length > dbConv.message_count) {
                 // ═══ CONTINUATION ═══
                 // Use the SAME account that owns this conversation's Qwen session
                 account = db.prepare('SELECT * FROM accounts WHERE id = ? AND active = 1').get(dbConv.account_id);
@@ -171,16 +173,16 @@ app.post('/v1/chat/completions', async (req, res) => {
                     isContinuation = true;
                     qwenChatId = dbConv.qwen_chat_id;
                     lastMsgId = dbConv.last_msg_id;
-                    finalContent = buildContinuationQuery(messages);
+                    finalContent = buildContinuationQuery(cleanedMessages);
 
-                    console.log(`[Conv] Continuation: ${convKey.slice(0, 12)}... | msgs: ${dbConv.message_count} -> ${messages.length} | account: ${account.email}`);
+                    console.log(`[Conv] Continuation: ${convKey.slice(0, 12)}... | msgs: ${dbConv.message_count} -> ${cleanedMessages.length} | account: ${account.email}`);
                 } else {
                     // Account was deactivated, wipe stale conversation
                     db.prepare('DELETE FROM conversations WHERE conv_key = ? AND api_key_hash = ?').run(convKey, apiKeyHash);
                     dbConv = null;
                 }
 
-            } else if (messages.length === dbConv.message_count && dbConv.last_msg_id) {
+            } else if (cleanedMessages.length === dbConv.message_count && dbConv.last_msg_id) {
                 // ═══ REROLL ═══
                 account = db.prepare('SELECT * FROM accounts WHERE id = ? AND active = 1').get(dbConv.account_id);
 
@@ -189,15 +191,16 @@ app.post('/v1/chat/completions', async (req, res) => {
                     isContinuation = true; // bypass new conversation creation
                     qwenChatId = dbConv.qwen_chat_id;
                     lastMsgId = dbConv.last_msg_id;
-                    finalContent = buildContinuationQuery(messages);
+                    lastUserMsgId = dbConv.last_user_msg_id;
+                    finalContent = buildContinuationQuery(cleanedMessages);
 
-                    console.log(`[Conv] Reroll: ${convKey.slice(0, 12)}... | msgs: ${messages.length} | account: ${account.email}`);
+                    console.log(`[Conv] Reroll: ${convKey.slice(0, 12)}... | msgs: ${cleanedMessages.length} | account: ${account.email}`);
                 } else {
                     db.prepare('DELETE FROM conversations WHERE conv_key = ? AND api_key_hash = ?').run(convKey, apiKeyHash);
                     dbConv = null;
                 }
             }
-            // If messages.length < dbConv.message_count, it means the user deleted messages -> new conversation
+            // If cleanedMessages.length < dbConv.message_count, it means the user deleted messages -> new conversation
         }
 
         if (!dbConv || !isContinuation) {
@@ -210,8 +213,8 @@ app.post('/v1/chat/completions', async (req, res) => {
                 return res.status(503).json({ error: { message: 'No active accounts available. Please add accounts in the admin panel.', type: 'server_error' } });
             }
 
-            finalContent = buildNewConversationQuery(messages);
-            console.log(`[Conv] New: ${convKey.slice(0, 12)}... | msgs: ${messages.length} | account: ${account.email}`);
+            finalContent = buildNewConversationQuery(cleanedMessages);
+            console.log(`[Conv] New: ${convKey.slice(0, 12)}... | msgs: ${cleanedMessages.length} | account: ${account.email}`);
         }
 
         // ── Get valid token ──
@@ -248,24 +251,25 @@ app.post('/v1/chat/completions', async (req, res) => {
             chat_id: qwenChatId,
             chat_mode: "normal",
             model: "qwen3.7-plus",
-            parent_id: lastMsgId,
+            parent_id: isReroll ? null : lastMsgId,
             messages: [{
                 fid: uuidv4(),
-                parentId: lastMsgId,
+                parentId: isReroll ? null : lastMsgId,
+                id: isReroll ? lastUserMsgId : undefined,
                 childrenIds: [uuidv4()],
                 role: "user",
                 content: finalContent,
-                user_action: "chat",
+                user_action: isReroll ? "retry" : "chat",
                 files: [],
                 timestamp: Math.floor(Date.now() / 1000),
                 models: ["qwen3.7-plus"],
                 chat_type: "t2t",
                 feature_config: {
-                    thinking_enabled: true,
+                    thinking_enabled: thinkingEnabled,
                     output_schema: "phase",
                     research_mode: "normal",
-                    auto_thinking: true,
-                    thinking_mode: "Auto",
+                    auto_thinking: autoThinking,
+                    thinking_mode: thinkingMode,
                     thinking_format: "summary",
                     auto_search: true
                 },
@@ -294,16 +298,19 @@ app.post('/v1/chat/completions', async (req, res) => {
 
         let fullContent = '';
         let fullThinking = '';
+        let printedCumulativeThinking = '';
         let newResponseId = null;
+        let newUserMsgId = null;
         let inThinkingPhase = false;
 
         const streamGen = sendChatMessage(token, payload);
         
         for await (const chunk of streamGen) {
-            // Extract the new parent_id (response_id) immediately
+            // Extract the new parent_id (response_id) and user msg id immediately
             if (chunk['response.created'] && chunk['response.created'].response_id) {
                 newResponseId = chunk['response.created'].response_id;
-            } else if (chunk.response_id) {
+                newUserMsgId = chunk['response.created'].parent_id;
+            } else if (chunk.response_id && !newResponseId) {
                 newResponseId = chunk.response_id;
             }
 
@@ -318,6 +325,19 @@ app.post('/v1/chat/completions', async (req, res) => {
                         }
                         fullThinking += '<think>\n';
                         inThinkingPhase = true;
+                    }
+                    
+                    if (delta.extra && delta.extra.summary_thought && delta.extra.summary_thought.content) {
+                        const currentTotalText = delta.extra.summary_thought.content.join('\n');
+                        const newDelta = currentTotalText.substring(printedCumulativeThinking.length);
+                        if (newDelta) {
+                            if (stream) {
+                                const c = createOpenAIChunk(completionId, model, newDelta);
+                                if (c) res.write(c);
+                            }
+                            printedCumulativeThinking = currentTotalText;
+                            fullThinking += newDelta;
+                        }
                     }
                 } else if (delta.phase === 'answer') {
                     if (inThinkingPhase) {
@@ -349,14 +369,15 @@ app.post('/v1/chat/completions', async (req, res) => {
             fullThinking += '\n</think>\n\n';
         }
 
-        // Update database with new lastMsgId
+        // Update database with new lastMsgId and userMsgId
         createOrUpdateConversation(
             convKey, 
             apiKeyHash, 
             qwenChatId, 
             account.id, 
-            messages.length, 
-            newResponseId
+            cleanedMessages.length, 
+            newResponseId,
+            newUserMsgId
         );
 
         if (stream) {
