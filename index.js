@@ -138,6 +138,10 @@ app.post('/v1/chat/completions', async (req, res) => {
         const model = req.body.model || 'qwen3.7-plus';
         const stream = req.body.stream;
 
+        // Abort controller to stop ghost-streaming if client disconnects
+        const abortController = new AbortController();
+        req.on('close', () => abortController.abort());
+
         if (!messages || !Array.isArray(messages) || messages.length === 0) {
             return res.status(400).json({ error: { message: 'messages array required', type: 'invalid_request' } });
         }
@@ -238,7 +242,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
         // ── Create new Qwen chat if needed ──
         if (!isContinuation) {
-            qwenChatId = await createNewChat(token);
+            qwenChatId = await createNewChat(token, abortController.signal);
         }
 
         bumpAccountUsage(account.id);
@@ -303,7 +307,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         let newUserMsgId = null;
         let inThinkingPhase = false;
 
-        const streamGen = sendChatMessage(token, payload);
+        const streamGen = sendChatMessage(token, payload, abortController.signal);
         
         for await (const chunk of streamGen) {
             // Extract the new parent_id (response_id) and user msg id immediately
@@ -412,6 +416,10 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
         
     } catch (e) {
+        if (e.name === 'AbortError') {
+            console.log('[Abort] Client disconnected, stream terminated.');
+            return res.end();
+        }
         console.error("Proxy Error:", e);
         if (!res.headersSent) {
             res.status(502).json({ error: { message: 'Upstream error: ' + e.message, type: 'upstream_error' } });
