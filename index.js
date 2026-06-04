@@ -138,9 +138,11 @@ app.post('/v1/chat/completions', async (req, res) => {
         const model = req.body.model || 'qwen3.7-plus';
         const stream = req.body.stream;
 
-        // Abort controller to stop ghost-streaming if client disconnects
         const abortController = new AbortController();
-        req.on('close', () => abortController.abort());
+        req.on('aborted', () => {
+            console.log('[Proxy] Client explicitly aborted the request mid-stream.');
+            abortController.abort();
+        });
 
         if (!messages || !Array.isArray(messages) || messages.length === 0) {
             return res.status(400).json({ error: { message: 'messages array required', type: 'invalid_request' } });
