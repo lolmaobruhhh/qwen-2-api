@@ -80,8 +80,9 @@ function generateConvKey(req, messages) {
     const nonSystem = messages.filter(m => m.role !== 'system');
     const earlyMessages = nonSystem.slice(0, 4).map(m => `${m.role}:${m.content || ''}`).join('|||');
 
-    // Also include the total non-system message count as extra entropy
-    const seed = systemContent + '|||MSGS|||' + earlyMessages + '|||COUNT|||' + nonSystem.length;
+    // Also include the total non-system message count as extra entropy? NO! 
+    // Including message length causes the hash to change every turn, breaking continuity.
+    const seed = systemContent + '|||MSGS|||' + earlyMessages;
 
     return crypto.createHash('sha256').update(seed).digest('hex');
 }
