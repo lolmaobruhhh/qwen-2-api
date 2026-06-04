@@ -3,7 +3,7 @@ import cors from 'cors';
 import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { getValidToken } from './lib/auth.js';
-import { createNewChat, sendChatMessage } from './lib/qwenClient.js';
+import { createNewChat, sendChatMessage, fetchQwenModels } from './lib/qwenClient.js';
 import { createOpenAIChunk, parseDirectives } from './lib/translator.js';
 import { config } from 'dotenv';
 import db, { 
@@ -117,15 +117,36 @@ function buildContinuationQuery(messages) {
 //  OPENAI-COMPATIBLE ROUTES
 // ══════════════════════════════════════════
 
-app.get('/v1/models', (req, res) => {
-    res.json({
-        object: 'list',
-        data: [
-            { id: 'qwen3.7-plus', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'alibaba' },
-            { id: 'qwen3.6-plus', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'alibaba' },
-            { id: 'qwen-max', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'alibaba' }
-        ]
-    });
+let cachedModels = null;
+let lastModelsFetch = 0;
+
+app.get('/v1/models', async (req, res) => {
+    if (cachedModels && (Date.now() - lastModelsFetch < 2 * 60 * 60 * 1000)) {
+        return res.json({ object: 'list', data: cachedModels });
+    }
+
+    const account = getNextAccount();
+    const fallbackList = [
+        { id: 'qwen3.7-plus', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'alibaba' },
+        { id: 'qwen-max', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'alibaba' },
+        { id: 'qwen-plus', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'alibaba' }
+    ];
+
+    if (!account) {
+        return res.json({ object: 'list', data: fallbackList });
+    }
+
+    try {
+        const token = await getValidToken(account);
+        const models = await fetchQwenModels(token);
+        
+        cachedModels = models;
+        lastModelsFetch = Date.now();
+        res.json({ object: 'list', data: models });
+    } catch (e) {
+        console.error('[Models] Failed to fetch live models:', e.message);
+        res.json({ object: 'list', data: cachedModels || fallbackList });
+    }
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
