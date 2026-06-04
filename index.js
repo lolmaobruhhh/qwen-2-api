@@ -259,7 +259,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
         // ── Create new Qwen chat if needed ──
         if (!isContinuation) {
-            qwenChatId = await createNewChat(token, abortController.signal);
+            qwenChatId = await createNewChat(token, abortController.signal, model);
         }
 
         bumpAccountUsage(account.id);
